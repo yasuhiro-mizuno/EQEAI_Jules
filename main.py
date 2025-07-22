@@ -10,11 +10,12 @@ import json
 # 環境変数の読み込み
 load_dotenv()
 
-# Azure OpenAIの設定
-openai.api_type = "azure"
-openai.api_key = os.getenv("AZURE_OPENAI_API_KEY")
-openai.api_base = os.getenv("AZURE_OPENAI_ENDPOINT")
-openai.api_version = os.getenv("AZURE_OPENAI_VERSION")
+# Azure OpenAIクライアントの初期化 (v1.0.0以降の作法)
+client = openai.AzureOpenAI(
+    api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+    api_version=os.getenv("AZURE_OPENAI_VERSION")
+)
 DEPLOYMENT_NAME = 'o4-mini'
 
 def extract_text_from_docx(file):
@@ -31,109 +32,105 @@ def extract_text_from_pdf(file):
         text += page.get_text()
     return text
 
-def extract_chapters(text):
-    chapters = {}
-    current_chapter = "不明"
-    # 例：1. や 1.1 などの章番号を正規表現で探す
-    for line in text.split('\n'):
-        match = re.match(r'^(\d+(\.\d+)*)\s+(.*)', line)
-        if match:
-            current_chapter = f"{match.group(1)} {match.group(3)}"
-        if current_chapter not in chapters:
-            chapters[current_chapter] = ""
-        chapters[current_chapter] += line + "\n"
-    return chapters
-
-def evaluate_text_with_llm(chapter_and_content, selected_rules):
-    # selected_rulesの日本語マッピング
+def evaluate_text_with_llm(text_content, selected_rules):
     rule_mapping = {
-        "conciseness": "簡潔な文",
-        "missing_elements": "必要な語の欠落",
-        "ambiguity": "曖昧語の回避",
-        "typos": "誤字脱字",
-        "dependency": "係り受け"
+        "conciseness": "簡潔な文: 受動態、二重否定、部分否定、使役表現が使われていないか。",
+        "missing_elements": "必要な語の欠落: 主語、述語、目的語が明確で、欠落していないか。",
+        "ambiguity": "曖昧語の回避: 「適切に」「可能な限り」などの曖昧な表現が使われていないか。",
+        "typos": "誤字脱字: 誤字や脱字がないか。",
+        "dependency": "係り受け: 係り受けが一意に解釈できるか。"
     }
-    active_rules = [rule_mapping[key] for key in selected_rules]
+    active_rules_text = "\n".join([f"- {rule_mapping[key]}" for key in selected_rules])
 
-    # プロンプトの構築
-    prompt = f"""
-# 命令
-あなたは、ソフトウェア要求仕様書の品質を評価する専門家です。
-以下の「制約条件」と「評価対象の文章」に基づき、表現品質を評価してください。
+    system_prompt = "あなたは、提供された文章を分析し、特定の品質基準に基づいて改善点を提案するAIアシスタントです。あなたの応答は、必ず指定されたJSON形式でなければなりません。他のテキストは一切含めないでください。"
 
-# 制約条件
-- 「評価対象の文章」に含まれる内容を1文ずつに分割し、すべての文を評価対象とします。
-- 各文に対して、以下の「表現品質評価ルール」を適用してください。
-- いずれかのルールに該当した文のみを、指摘事項として結果に含めてください。
-- 指摘事項がない場合は、 `"results": []` という空のリストを持つJSONを返してください。
-- 結果は必ずJSON形式で、以下の構造に従って出力してください。マークダウンのコードブロック(` ```json `)は含めないでください。
+    user_prompt = f"""
+以下の「品質基準」に従って、「評価対象の文章」の各文を評価してください。
+結果をJSON形式で返してください。
 
+# 品質基準
+{active_rules_text}
+
+# 出力形式の例
 {{
-  "results": [
+  "evaluations": [
     {{
-      "chapter": "章番号・章名",
-      "original_sentence": "元の記述",
-      "reason": "指摘理由（どのルールに違反したか具体的に記述）",
-      "suggestion": "改善案"
+      "original_sentence": "ユーザーによりデータが送信される。",
+      "has_issue": true,
+      "reason": "簡潔な文：受動態が使用されています。",
+      "suggestion": "ユーザーがデータを送信する。"
+    }},
+    {{
+      "original_sentence": "この文には問題ありません。",
+      "has_issue": false,
+      "reason": "",
+      "suggestion": ""
     }}
   ]
 }}
 
-# 表現品質評価ルール
-あなたがチェックすべきルールは以下の通りです： {', '.join(active_rules)}
-- **簡潔な文**: 受動態、二重否定、部分否定、使役表現が使われていないか。
-- **必要な語の欠落**: 主語、述語、目的語が明確で、欠落していないか。
-- **曖昧語の回避**: 「適切に」「可能な限り」などの曖昧な表現が使われていないか。
-- **誤字脱字**: 誤字や脱字がないか。
-- **係り受け**: 係り受けが一意に解釈できるか。
-
 # 評価対象の文章
-{chapter_and_content}
+{text_content}
 """
 
     try:
-        response = openai.ChatCompletion.create(
-            engine=DEPLOYMENT_NAME,
+        response = client.chat.completions.create(
+            model=DEPLOYMENT_NAME,
             messages=[
-                {"role": "system", "content": "あなたは、ソフトウェア要求仕様書の品質を評価する専門家です。"},
-                {"role": "user", "content": prompt}
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
             ],
             max_tokens=4096,
-            temperature=0.0 # 再現性を高めるため
+            temperature=0.1
         )
-        return response.choices[0].message['content']
+        content = response.choices[0].message.content
+
+        # LLMの応答からJSONオブジェクトを抽出する
+        match = re.search(r'\{.*\}', content, re.DOTALL)
+        if match:
+            return match.group(0)
+        else:
+            return f'{{"error": "LLM response did not contain a valid JSON object.", "raw_response": "{json.dumps(content)}"}}'
+
     except Exception as e:
         return f'{{"error": "An error occurred: {str(e)}"}}'
 
 import json
 
 def parse_llm_response_to_markdown_table(responses):
-    header = "| 章番号・章名 | 元の記述 | 指摘理由 | 改善案 |\n|--------------|-----------|-----------|---------|"
-    all_rows = []
+    header = "| 元の記述 | 改善点の詳細 | 改善案 |\n|-----------|-----------|---------|"
+    issue_rows = []
+    all_evaluations = [] # すべての評価結果を格納するリスト
+    parsing_errors = [] # パースエラー情報を格納するリスト
 
     for res_str in responses:
         try:
             data = json.loads(res_str)
             if "error" in data:
-                # エラーの場合はフッターに表示するためにNoneを返すなどの処理も可能
+                parsing_errors.append({"response": res_str, "error": data["error"]})
                 continue
 
-            results = data.get("results", [])
-            for item in results:
-                row = f"| {item.get('chapter', '')} | {item.get('original_sentence', '')} | {item.get('reason', '')} | {item.get('suggestion', '')} |"
-                all_rows.append(row)
-        except json.JSONDecodeError:
-            # JSONパースエラーのハンドリング
-            # ここではエラーを無視するが、ログに出力するなどの対応が望ましい
+            evaluations = data.get("evaluations", [])
+            all_evaluations.extend(evaluations) # UI表示用にすべての評価を保存
+
+            for item in evaluations:
+                if item.get("has_issue"):
+                    row = f"| {item.get('original_sentence', '')} | {item.get('reason', '')} | {item.get('suggestion', '')} |"
+                    issue_rows.append(row)
+
+        except json.JSONDecodeError as e:
+            parsing_errors.append({"response": res_str, "error": f"JSONDecodeError: {e}"})
             continue
-        except Exception:
-            # その他の予期せぬエラー
+        except AttributeError as e:
+            parsing_errors.append({"response": res_str, "error": f"AttributeError: {e}"})
             continue
 
-    if not all_rows:
-        return "指摘事項は見つかりませんでした。"
+    if not issue_rows:
+        table = "指摘事項は見つかりませんでした。"
+    else:
+        table = header + "\n" + "\n".join(issue_rows)
 
-    return header + "\n" + "\n".join(all_rows)
+    return table, all_evaluations, parsing_errors
 
 
 def main():
@@ -168,36 +165,49 @@ def main():
                     elif uploaded_file.type == "application/pdf":
                         text = extract_text_from_pdf(uploaded_file)
 
-                    chapters = extract_chapters(text)
-                    all_results = []
-                    progress_bar = st.progress(0)
-
-                    for i, (chapter, content) in enumerate(chapters.items()):
-                        # contentが空の場合はスキップ
-                        if not content.strip():
-                            continue
-
-                        chapter_and_content = f"章: {chapter}\n内容:\n{content}"
-                        llm_response = evaluate_text_with_llm(chapter_and_content, selected_rules)
-
-                        all_results.append(llm_response)
-                        progress_bar.progress((i + 1) / len(chapters))
-
+                    llm_response = evaluate_text_with_llm(text, selected_rules)
 
                     # LLMの応答をパースしてMarkdownの表形式に変換
-                    markdown_table = parse_llm_response_to_markdown_table(all_results)
+                    markdown_table, all_evaluations, parsing_errors = parse_llm_response_to_markdown_table([llm_response])
 
                     st.success("評価が完了しました。")
-                    st.markdown("### 評価結果")
+
+                    st.markdown("### 確認結果サマリー（改善点のみ）")
                     st.markdown(markdown_table)
 
                     # ダウンロードボタン
                     st.download_button(
-                        label="Markdown形式でダウンロード",
+                        label="確認結果サマリーをダウンロード",
                         data=markdown_table,
-                        file_name="evaluation_result.md",
+                        file_name="review_summary.md",
                         mime="text/markdown",
                     )
+
+                    # パースエラーがあった場合に詳細を表示
+                    if parsing_errors:
+                        with st.expander("LLM応答の解析エラー"):
+                            st.error("いくつかのLLMの応答を解析できませんでした。以下に詳細を示します。")
+                            for error_info in parsing_errors:
+                                st.markdown("**エラー内容:**")
+                                st.code(error_info.get("error"))
+                                st.markdown("**LLMからの生の応答:**")
+                                st.code(error_info.get("response"))
+                                st.divider()
+
+                    # すべての評価結果を詳細表示
+                    with st.expander("すべての確認プロセスを表示（分割された文章と確認結果）"):
+                        if not all_evaluations and not parsing_errors:
+                            st.info("確認対象の文章が見つかりませんでした。")
+                        else:
+                            for item in all_evaluations:
+                                if item.get("has_issue"):
+                                    st.error(f"**元の文:** {item.get('original_sentence')}")
+                                    st.markdown(f"**改善点の詳細:** {item.get('reason')}")
+                                    st.markdown(f"**改善案:** {item.get('suggestion')}")
+                                else:
+                                    st.success(f"**元の文:** {item.get('original_sentence')}")
+                                    st.markdown("_改善点なし_")
+                                st.divider()
             else:
                 st.error("ファイルをアップロードしてください。")
     except Exception as e:
