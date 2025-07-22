@@ -62,22 +62,21 @@ def evaluate_text_with_llm(chapter_and_content, selected_rules):
 以下の「制約条件」と「評価対象の文章」に基づき、表現品質を評価してください。
 
 # 制約条件
-- 「評価対象の文章」に含まれる内容を1文ずつに分割し、すべての文を評価対象とします。
-- 各文に対して、以下の「表現品質評価ルール」を適用してください。
-- いずれかのルールに該当した文のみを、指摘事項として結果に含めてください。
-- 指摘事項がない場合は、 `"results": []` という空のリストを持つJSONを返してください。
-- 結果は必ずJSON形式で、以下の構造に従って出力してください。マークダウンのコードブロック(` ```json `)は含めないでください。
-
-{{
-  "results": [
-    {{
-      "chapter": "章番号・章名",
-      "original_sentence": "元の記述",
-      "reason": "指摘理由（どのルールに違反したか具体的に記述）",
-      "suggestion": "改善案"
-    }}
-  ]
-}}
+- まず、与えられた文章を1文ずつに分割してください。
+- 分割した文の中から、ソフトウェアの要求や仕様に関連する文のみを抽出してください。要求仕様と関係ない文は無視してください。
+- 抽出した各要求文に対して、以下の「表現品質評価ルール」を適用してください。
+- 評価の結果、指摘事項があった文のみを結果として出力してください。指摘がない文は出力に含めないでください。
+- 結果は必ずJSON形式で、以下の構造に従って出力してください。
+  {{
+    "results": [
+      {{
+        "chapter": "章番号・章名",
+        "original_sentence": "元の記述",
+        "reason": "指摘理由（どのルールに違反したか）",
+        "suggestion": "改善案"
+      }}
+    ]
+  }}
 
 # 表現品質評価ルール
 あなたがチェックすべきルールは以下の通りです： {', '.join(active_rules)}
@@ -113,6 +112,10 @@ def parse_llm_response_to_markdown_table(responses):
 
     for res_str in responses:
         try:
+            # LLMの応答に含まれる可能性のあるマークダウンのコードブロック表記を削除
+            if res_str.strip().startswith("```json"):
+                res_str = res_str.strip()[7:-4]
+
             data = json.loads(res_str)
             if "error" in data:
                 # エラーの場合はフッターに表示するためにNoneを返すなどの処理も可能
@@ -179,7 +182,6 @@ def main():
 
                         chapter_and_content = f"章: {chapter}\n内容:\n{content}"
                         llm_response = evaluate_text_with_llm(chapter_and_content, selected_rules)
-
                         all_results.append(llm_response)
                         progress_bar.progress((i + 1) / len(chapters))
 
